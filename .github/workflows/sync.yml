@@ -1,0 +1,45 @@
+name: Sync BakaSU CI Builds
+
+# Periodically mirror successful upstream BakaSU builds into this repository's
+# releases. Can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'How many of the latest successful upstream runs to inspect'
+        required: false
+        default: '50'
+      dry_run:
+        description: 'Prepare assets without publishing releases'
+        type: boolean
+        required: false
+        default: false
+
+# Least privilege: the job only needs to create releases in this repository.
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-bakasu
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync upstream builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          N_LATEST_RUNS: ${{ github.event.inputs.limit || '50' }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY")
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/sync_release.py "${args[@]}"
