@@ -4,7 +4,7 @@ name: Sync BakaSU CI Builds
 # releases. Can also be triggered manually from the Actions tab.
 on:
   schedule:
-    - cron: '0 */8 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       limit:

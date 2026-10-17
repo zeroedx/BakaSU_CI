@@ -2,20 +2,30 @@
 """Sync successful BakaSU CI builds into this repository's GitHub Releases.
 
 The script discovers completed, successful "Build Manager" runs on the upstream
-default branch, downloads the artifacts they produced, republishes them under a
-per-run tag, and records full provenance (commit SHA, run id, run URL, build
-time).
+default branch, downloads the artifacts they produced, republishes the ARM64
+subset under a per-run tag, and records full provenance (commit SHA, run id, run
+URL, build time).
 
-Design decisions that are specific to BakaSU (verified against live runs):
+This project only mirrors **ARM64 (aarch64)** artifacts. Architecture is
+determined from the actual build output, never from the artifact name alone:
+
+* The manager APK is inspected for its ``lib/<abi>`` directories; only an APK
+  whose sole ABI is ``arm64-v8a`` is kept. Note that the APK ABI field
+  (``arm64-v8a``) is a different naming scheme from the kernel module field
+  (``aarch64``).
+* ``ksud``/``ksuinit`` archives are opened and their main ELF binary's
+  ``e_machine`` field is read. ``ksud-armv7-linux-androideabi`` is 32-bit ARM
+  and is therefore *not* ARM64.
+
+Other verified facts about the upstream artifacts:
 
 * ``Manager-release`` and ``Spoofed-Manager-release`` contain APKs with
-  *identical* file names, so the spoofed variant is deliberately excluded to
-  avoid clobbering the normal build.
+  *identical* file names, so the spoofed variant is deliberately excluded.
 * ``aarch64-<kmi>-lkm`` and ``x86_64-<kmi>-lkm`` both contain
-  ``<kmi>_kernelsu.ko``. Aggregating them into a single archive would overwrite
-  one architecture with the other, so modules are grouped per architecture.
-* ``Manager-mappings`` (ProGuard mappings) and ``telegram-bot-api-binary`` are
-  CI-only tooling and are never published.
+  ``<kmi>_kernelsu.ko``. Modules are kept per KMI (the file name encodes the
+  KMI) so incompatible kernels are never conflated.
+* ``Manager-debug``, ``Manager-mappings`` (ProGuard mappings),
+  ``telegram-bot-api-binary`` and every non-ARM64 artifact are never published.
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -41,12 +52,13 @@ DEFAULT_WORKFLOW = "build-manager.yml"
 DEFAULT_BRANCH = "main"
 DEFAULT_LIMIT = 50
 
-# Artifacts that are never published (CI tooling / debug info / duplicate build).
+# Artifacts that are never published (debug info / CI tooling / duplicate build).
 EXCLUDE_EXACT = {"telegram-bot-api-binary"}
 EXCLUDE_PREFIX = ("Spoofed-",)
 EXCLUDE_SUFFIX = ("-mappings",)
 
-APK_ARTIFACTS = ("Manager-release", "Manager-debug")
+# Only the release manager APK is published (the debug APK is excluded).
+APK_ARTIFACTS = ("Manager-release",)
 # A run must contain this artifact to be considered a complete, publishable build.
 REQUIRED_ARTIFACTS = ("Manager-release",)
 
@@ -56,11 +68,32 @@ KSUINIT_RE = re.compile(r"^ksuinit-(.+)$")
 
 # An APK asset must be a flat, safe file name (no path traversal / odd chars).
 APK_SAFE_RE = re.compile(r"^[A-Za-z0-9._+\-]+\.apk$")
-# e.g. BakaSU_v4.2.0-rc3_35231-universal-release.apk -> v4.2.0-rc3
-VERSION_RE = re.compile(r"^[^_]+_(?P<version>.+?)_\d+-[A-Za-z0-9_]+-release\.apk$")
+# e.g. BakaSU_v4.2.0-rc3_35231-arm64-v8a-release.apk -> v4.2.0-rc3
+VERSION_RE = re.compile(r"^[^_]+_(?P<version>.+?)_\d+-[A-Za-z0-9_.\-]+-release\.apk$")
 PRERELEASE_RE = re.compile(r"-(rc|alpha|beta|pre|dev)\d*$", re.IGNORECASE)
 
 TAG_PREFIX = "BakaSU_"
+
+# --- ARM64 selection -------------------------------------------------------
+# APK ABI directory names that are 64-bit ARM. The Android ABI name
+# ("arm64-v8a") differs from the kernel-module naming field ("aarch64").
+ARM64_APK_ABI = "arm64-v8a"
+# ELF e_machine value for AArch64 (EM_AARCH64).
+EM_AARCH64 = 0xB7
+# Architecture tokens that are never ARM64. Used only as a *pre-download* filter
+# so obviously foreign artifacts are not fetched at all; inclusion is still
+# decided by inspecting the real build output (APK ABIs / ELF headers).
+NON_ARM64_TOKENS = (
+    "x86_64", "x86-64", "amd64", "x86", "i686",
+    "armv7", "armeabi-v7a", "armeabi", "arm-linux",
+    "riscv64", "riscv",
+)
+
+
+def is_non_arm64_name(name: str) -> bool:
+    """Cheap pre-download filter: does the artifact name identify a non-ARM64 build?"""
+    lowered = name.lower()
+    return any(token in lowered for token in NON_ARM64_TOKENS)
 
 
 class ApiError(RuntimeError):
@@ -220,6 +253,69 @@ def download_artifact(repo: str, artifact: dict, token: str, dest_dir: str) -> s
     return path
 
 
+def apk_abis(path: str) -> set[str] | None:
+    """Return the set of ABI names from an APK's ``lib/<abi>/`` directories.
+
+    Returns ``None`` if the file is not a readable zip archive.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+    except zipfile.BadZipFile:
+        return None
+    abis = set()
+    for member in names:
+        parts = member.split("/")
+        if len(parts) > 2 and parts[0] == "lib" and parts[1]:
+            abis.add(parts[1])
+    return abis
+
+
+def is_arm64_apk(path: str) -> bool:
+    """True when the APK ships native code for ARM64 and nothing else.
+
+    A ``universal`` APK bundles several ABIs; it is intentionally *not* treated
+    as an ARM64 package, and neither is a 32-bit ``armeabi-v7a`` APK.
+    """
+    abis = apk_abis(path)
+    return abis == {ARM64_APK_ABI}
+
+
+def find_elf_member(zf: zipfile.ZipFile, *basenames: str) -> str | None:
+    """Find an archive member whose basename matches and that is an ELF file."""
+    candidates = []
+    for member in zf.namelist():
+        if member.endswith("/"):
+            continue
+        if os.path.basename(member) in basenames:
+            candidates.append(member)
+    for member in candidates:
+        data = zf.read(member)
+        if len(data) >= 20 and data[:4] == b"\x7fELF":
+            return member
+    return candidates[0] if candidates else None
+
+
+def is_arm64_tool(path: str, *basenames: str) -> bool:
+    """True when an archive's main binary is an AArch64 ELF executable.
+
+    ``basenames`` are the expected binary names inside the archive. The check
+    reads the real ELF header, so a 32-bit ARM (``armv7``) or x86_64 build is
+    never mistaken for ARM64 based on its artifact name.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            member = find_elf_member(zf, *basenames)
+            if member is None:
+                return False
+            header = zf.read(member)[:20]
+    except zipfile.BadZipFile:
+        return False
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        return False
+    return struct.unpack_from("<H", header, 18)[0] == EM_AARCH64
+
+
 def classify(name: str) -> str:
     if name in EXCLUDE_EXACT or name.startswith(EXCLUDE_PREFIX) or name.endswith(EXCLUDE_SUFFIX):
         return "exclude"
@@ -238,8 +334,8 @@ def is_valid_apk(member: str) -> bool:
 
 
 def version_from_apk(apk_names: list[str]) -> str | None:
-    # Prefer the universal APK; fall back to any release APK.
-    for candidate in sorted(apk_names, key=lambda n: ("universal" not in n, n)):
+    # Only ARM64 APKs reach this point; prefer the arm64-v8a build.
+    for candidate in sorted(apk_names, key=lambda n: (ARM64_APK_ABI not in n, n)):
         match = VERSION_RE.match(candidate)
         if match:
             return match.group("version")
@@ -258,12 +354,15 @@ def prepare_run(repo: str, run: dict, token: str, workdir: str) -> dict | None:
 
     assets: list[tuple[str, str]] = []       # (local path, published file name)
     apk_names: list[str] = []
-    lkm_by_arch: dict[str, dict[str, str]] = {}
+    lkm_by_kmi: dict[str, str] = {}          # KMI -> local .ko path
 
     for artifact in sorted(artifacts, key=lambda a: a["name"]):
         name = artifact["name"]
         kind = classify(name)
         if kind == "exclude":
+            continue
+        if is_non_arm64_name(name):
+            log(f"  - {name}: non-ARM64 artifact, not downloading")
             continue
         path = download_artifact(repo, artifact, token, workdir)
         if path is None:
@@ -284,36 +383,52 @@ def prepare_run(repo: str, run: dict, token: str, workdir: str) -> dict | None:
                     out = os.path.join(workdir, base)
                     with zf.open(member) as src, open(out, "wb") as dst:
                         shutil.copyfileobj(src, dst)
+                    if not is_arm64_apk(out):
+                        log(f"  - {name}: '{base}' is not an ARM64-only APK "
+                            f"(abis={sorted(apk_abis(out) or [])}), skipping")
+                        os.remove(out)
+                        continue
                     apk_names.append(base)
                     assets.append((out, base))
         elif kind == "lkm":
-            arch = LKM_RE.match(name).group(1)
+            match = LKM_RE.match(name)
+            if match.group(1) != "aarch64":
+                log(f"  - {name}: not an ARM64 LKM artifact, skipping")
+                continue
             with zipfile.ZipFile(path) as zf:
                 for member in zf.namelist():
                     if not member.endswith(".ko"):
                         continue
                     base = os.path.basename(member)
-                    bucket = lkm_by_arch.setdefault(arch, {})
-                    if base in bucket:
-                        log(f"  - {name}: duplicate module '{base}', skipping")
+                    if not is_arm64_tool(path, base):
+                        log(f"  - {name}: '{base}' is not an AArch64 module, skipping")
                         continue
-                    out = os.path.join(workdir, f"{arch}_{base}")
+                    # KMI is encoded in the module file name, e.g. android14-6.1_kernelsu.ko
+                    kmi = base[:-len("_kernelsu.ko")] if base.endswith("_kernelsu.ko") else base
+                    if kmi in lkm_by_kmi:
+                        log(f"  - {name}: duplicate module for KMI '{kmi}', skipping")
+                        continue
+                    out = os.path.join(workdir, f"aarch64_{base}")
                     with zf.open(member) as src, open(out, "wb") as dst:
                         shutil.copyfileobj(src, dst)
-                    bucket[base] = out
-        else:  # ksud / ksuinit: republish the original artifact archive verbatim
+                    lkm_by_kmi[kmi] = out
+        else:  # ksud / ksuinit: keep only ARM64, then republish the archive verbatim
+            if not is_arm64_tool(path, "ksud", "ksuinit"):
+                log(f"  - {name}: not an ARM64 tool artifact, skipping")
+                continue
             assets.append((path, f"{name}.zip"))
 
     if not apk_names:
-        log("  - no valid APKs found; skipping run")
+        log("  - no valid ARM64 APKs found; skipping run")
         return None
 
-    for arch, modules in sorted(lkm_by_arch.items()):
-        archive = os.path.join(workdir, f"lkm-{arch}-all.zip")
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-            for base, src in sorted(modules.items()):
-                zf.write(src, arcname=base)
-        assets.append((archive, f"lkm-{arch}-all.zip"))
+    if lkm_by_kmi:
+        # One module per KMI, kept as individual assets so distinct kernels are
+        # never conflated into a single ambiguous bundle.
+        for kmi, src in sorted(lkm_by_kmi.items()):
+            assets.append((src, f"{kmi}_kernelsu.ko"))
+    else:
+        log("  - warning: no ARM64 kernel modules found for this run")
 
     version = version_from_apk(apk_names) or f"run-{run_id}"
     prerelease = bool(PRERELEASE_RE.search(version))
@@ -350,8 +465,13 @@ def build_body(repo: str, info: dict) -> str:
         lines.append(f"- `{published}`")
     lines += [
         "",
-        "Generated by BakaSU_CI. Upstream artifacts are published as-is; kernel "
-        "modules are grouped per architecture to avoid mixing incompatible builds.",
+        "This mirror publishes **ARM64 (aarch64)** artifacts only. The manager APK "
+        "is the `arm64-v8a` build; kernel modules are published one file per KMI so "
+        "that modules for different kernels are never conflated. Non-ARM64 "
+        "artifacts, the spoofed manager, debug APKs, ProGuard mappings and CI "
+        "tooling are intentionally omitted.",
+        "",
+        "Generated by BakaSU_CI.",
     ]
     return "\n".join(lines)
 
