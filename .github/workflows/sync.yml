@@ -10,7 +10,7 @@ on:
       limit:
         description: 'How many of the latest successful upstream runs to inspect'
         required: false
-        default: '50'
+        default: '1'
       dry_run:
         description: 'Prepare assets without publishing releases'
         type: boolean
@@ -35,7 +35,7 @@ jobs:
       - name: Sync upstream builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          N_LATEST_RUNS: ${{ github.event.inputs.limit || '50' }}
+          N_LATEST_RUNS: ${{ github.event.inputs.limit || '1' }}
         run: |
           set -euo pipefail
           args=(--repo "$GITHUB_REPOSITORY")
